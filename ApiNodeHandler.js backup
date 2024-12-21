@@ -1,0 +1,265 @@
+import axios from 'axios';
+
+export class ApiCallHandler {
+    static async handle(node, context, userInput) {
+        try {
+
+console.timeLog("api call handler: ", node, context, userInput , "===================================================================================================================");
+            // Log initial state
+            console.log('API DEBUG: Starting API call', { nodeId: node._id, context });
+
+            // Extract API configuration from node
+            const apiConfig = {
+                name: node.name,
+                description: node.description,
+                endpoint: node.reqUrl,
+                method: node.methods,
+                pathVariables: node.matchedPathVariableList || [],
+                urlParams: node.urlParams || [],
+                headers: node.headers?.reduce((acc, h) => ({ ...acc, [h.key]: h.value }), {}),
+                authorization: node.authorization || { authType: "none", credential: {} },
+                body: node.body || { type: "none", bodyData: [] }
+            };
+
+            if (!apiConfig.endpoint || !apiConfig.method) {
+                throw new Error('API configuration missing required fields');
+            }
+
+            // Prepare API request
+            const request = await this.prepareRequest(apiConfig, context);
+            console.log(JSON.stringify({
+                event: 'ApiCall_Request',
+                endpoint: request.url,
+                method: request.method,
+                headers: request.headers,
+                body: request.data
+            }, null, 2));
+
+            // Make API call
+            const response = await this.makeApiCall(request);
+            console.log('API DEBUG: Response received', { response });
+
+            // Map response data to context
+            const updatedContext = { ...userInput };  // Use userInput as base context
+            
+            if (node.responseMapPathList) {
+                for (const mapping of node.responseMapPathList) {
+                    const value = this.getValueFromJsonPath(response.data, mapping.jsonPath) || mapping.fallback;
+                    updatedContext[mapping.value] = value;
+                    console.log('API DEBUG: Mapped value', { path: mapping.jsonPath, value, target: mapping.value });
+                }
+            }
+
+            // Add API response metadata
+            updatedContext.fetch_balance_api_response = response.data;
+            updatedContext.lastApiResponse = response.data;
+            updatedContext.lastApiStatus = response.status;
+
+            console.log('API DEBUG: Final context', { updatedContext });
+
+            // Find matching response status handler
+            const statusHandler = node.responseStatus?.find(s => s.status === response.status);
+            if (!statusHandler) {
+                throw new Error(`No handler found for response status: ${response.status}`);
+            }
+
+            return {
+                success: true,
+                type: 'api',
+                data: response.data,
+                context: updatedContext,
+                nextNode: statusHandler.next
+            };
+        } catch (error) {
+            console.error('API Call Error:', error);
+            return {
+                success: false,
+                type: 'error',
+                message: error.message
+            };
+        }
+    }
+
+    static async prepareRequest(apiConfig, context) {
+        const { endpoint, method, headers = {}, pathVariables = [], urlParams = [], authorization, body } = apiConfig;
+
+        // Resolve path variables in endpoint
+        let resolvedEndpoint = endpoint;
+        pathVariables.forEach(variable => {
+            const value = this.resolveDynamicValues(variable.value, context);
+            resolvedEndpoint = resolvedEndpoint.replace(`{{${variable.key}}}`, value);
+        });
+
+        // Add URL parameters if any
+        if (urlParams.length > 0) {
+            const params = new URLSearchParams();
+            urlParams.forEach(param => {
+                const value = this.resolveDynamicValues(param.value, context);
+                if (value !== undefined) {
+                    params.append(param.key, value);
+                }
+            });
+            resolvedEndpoint += `?${params.toString()}`;
+        }
+        
+        // Resolve dynamic values in headers
+        const resolvedHeaders = {
+            ...headers
+        };
+
+        // Add authorization headers if needed
+        if (authorization.authType !== "none") {
+            switch (authorization.authType) {
+                case "bearer":
+                    resolvedHeaders["Authorization"] = `Bearer ${authorization.credential.token}`;
+                    break;
+                case "basic":
+                    const basicAuth = Buffer.from(`${authorization.credential.username}:${authorization.credential.password}`).toString('base64');
+                    resolvedHeaders["Authorization"] = `Basic ${basicAuth}`;
+                    break;
+                case "apiKey":
+                    if (authorization.credential.in === "header") {
+                        resolvedHeaders[authorization.credential.name] = authorization.credential.value;
+                    }
+                    break;
+            }
+        }
+
+        // Prepare request body if needed
+        let resolvedBody = undefined;
+        if (body.type !== "none" && body.bodyData.length > 0) {
+            switch (body.type) {
+                case "json":
+                    resolvedBody = {};
+                    body.bodyData.forEach(item => {
+                        const value = this.resolveDynamicValues(item.value, context);
+                        resolvedBody[item.key] = value;
+                    });
+                    break;
+                case "formData":
+                    resolvedBody = new FormData();
+                    body.bodyData.forEach(item => {
+                        const value = this.resolveDynamicValues(item.value, context);
+                        resolvedBody.append(item.key, value);
+                    });
+                    break;
+                case "urlencoded":
+                    resolvedBody = new URLSearchParams();
+                    body.bodyData.forEach(item => {
+                        const value = this.resolveDynamicValues(item.value, context);
+                        resolvedBody.append(item.key, value);
+                    });
+                    break;
+            }
+        }
+
+        return {
+            url: resolvedEndpoint,
+            method: method.toUpperCase(),
+            headers: resolvedHeaders,
+            data: resolvedBody
+        };
+    }
+
+    static resolveDynamicValues(template, context) {
+        if (typeof template !== 'string') return template;
+        return template.replace(/{{([^}]+)}}/g, (match, variable) => {
+            const value = variable.split('.').reduce((obj, key) => obj?.[key], context);
+            return value !== undefined ? value : '';
+        });
+    }
+
+    static getValueFromJsonPath(obj, path) {
+        try {
+            // Handle empty or invalid path
+            if (!path) return undefined;
+
+            // Split the path into segments, handling both dot notation and array indices
+            const segments = path.split(/[\.\[\]]/).filter(Boolean);
+            
+            // Traverse the object using the path segments
+            return segments.reduce((current, segment) => {
+                // Handle array indices
+                if (segment.match(/^\d+$/)) {
+                    return current?.[parseInt(segment, 10)];
+                }
+                // Handle object properties
+                return current?.[segment];
+            }, obj);
+        } catch (error) {
+            console.error('Error getting value from JSON path:', error);
+            return undefined;
+        }
+    }
+
+    static async makeApiCall(request) {
+        
+        console.log('🚀 ~ makeApiCall ~ request triggered in line 234 request:', request);
+        
+        try {
+            // Call AWS test API instead of actual API
+            const testResponse = await axios({
+                method: 'get',
+                url: 'https://45ibi2iufk.execute-api.us-east-1.amazonaws.com/dev/hello',
+                params: {
+                    name: 'John',
+                    age: 30
+                }
+            });
+
+            // If AWS API call is successful, return mock data based on the request URL
+            if (testResponse.status === 200) {
+                let mockData = {};
+                
+                if (request.url.includes('/balance')) {
+                    mockData = {
+                        status: 200,
+                        success: true,
+                        data: {
+                            data: {
+                                balance: 5000.75,
+                                currency: "USD",
+                                lastUpdated: "2024-12-07T08:45:30Z"
+                            }
+                        }
+                    };
+                } else if (request.url.includes('/transactions')) {
+                    mockData = {
+                        status: 200,
+                        success: true,
+                        data: {
+                            data: {
+                                transactions: [
+                                    { id: "TX001", amount: 500, type: "credit", date: "2024-12-07" },
+                                    { id: "TX002", amount: -100, type: "debit", date: "2024-12-06" }
+                                ],
+                                count: 2
+                            }
+                        }
+                    };
+                } else if (request.url.includes('/transfers')) {
+                    mockData = {
+                        status: 200,
+                        success: true,
+                        data: {
+                            data: {
+                                transactionId: "TRF" + Date.now(),
+                                status: "SUCCESS",
+                                amount:  request?.data?.transferAmount || 1000,
+                                recipientAccountNumber: request?.data?.recipientAccountNumber,
+                                fee: request.url.includes('/external') ? 25 : 0
+                            }
+                        }
+                    };
+                }
+
+                return mockData;
+            }
+        } catch (error) {
+            console.error('API Call Error:', error);
+            throw error;
+        }
+    }
+}
+
+export default ApiCallHandler;
